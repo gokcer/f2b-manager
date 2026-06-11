@@ -26,24 +26,32 @@ echo "  ║     f2b-manager — Installer       ║"
 echo "  ╚═══════════════════════════════════╝"
 echo ""
 
-# Check dependencies
-for cmd in dialog fail2ban-client; do
-    if ! command -v "$cmd" &>/dev/null; then
-        warn "'$cmd' not found. Attempting to install..."
-        if command -v apt-get &>/dev/null; then
-            apt-get install -y "$cmd" || error "Failed to install $cmd"
-        elif command -v dnf &>/dev/null; then
-            dnf install -y "$cmd" || error "Failed to install $cmd"
-        elif command -v yum &>/dev/null; then
-            yum install -y "$cmd" || error "Failed to install $cmd"
-        elif command -v pacman &>/dev/null; then
-            pacman -S --noconfirm "$cmd" || error "Failed to install $cmd"
-        else
-            error "Cannot auto-install '$cmd'. Please install it manually."
-        fi
+# Check dialog
+if ! command -v dialog &>/dev/null; then
+    warn "'dialog' not found. Attempting to install..."
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y dialog || error "Failed to install dialog"
+    elif command -v dnf &>/dev/null; then
+        dnf install -y dialog || error "Failed to install dialog"
+    elif command -v yum &>/dev/null; then
+        yum install -y dialog || error "Failed to install dialog"
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm dialog || error "Failed to install dialog"
+    else
+        error "Cannot auto-install 'dialog'. Please install it manually."
     fi
-    info "$cmd found: $(command -v "$cmd")"
-done
+fi
+info "dialog found: $(command -v dialog)"
+
+# Check fail2ban availability (native or Docker)
+if command -v fail2ban-client &>/dev/null; then
+    info "fail2ban-client found: $(command -v fail2ban-client)"
+elif command -v docker &>/dev/null; then
+    info "docker found — will use Docker-based fail2ban"
+else
+    warn "Neither fail2ban-client nor docker found on this host."
+    warn "Install fail2ban or ensure a fail2ban Docker container is running."
+fi
 
 # Install
 install -m 755 "${SOURCE_DIR}/${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"

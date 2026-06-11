@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # f2b-manager — Interactive TUI for managing fail2ban bans & whitelist
+# Supports both native and Docker-based fail2ban installations.
 #
 # https://github.com/gokcer/f2b-manager
 # License: MIT
@@ -8,34 +9,190 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 DIALOG=${DIALOG:-dialog}
-DIALOG_OK=0
 BACKTITLE="fail2ban Manager v${VERSION}"
-WHITELIST_FILE="/etc/fail2ban/jail.local"
+
+# Resolved at startup by detect_mode()
+F2B_MODE=""          # "native" or "docker"
+F2B_CONTAINER=""     # container name/id when docker
+WHITELIST_FILE=""    # path to jail.local (host-side for docker mounts)
+F2B_LOG=""           # path to fail2ban.log (host-side or container)
 
 die() { $DIALOG --backtitle "$BACKTITLE" --msgbox "ERROR: $1" 8 60; exit 1; }
+
+# ─── Mode Detection ───────────────────────────────────────────────────
+
+f2b_exec() {
+    if [[ "$F2B_MODE" == "docker" ]]; then
+        docker exec "$F2B_CONTAINER" fail2ban-client "$@" 2>/dev/null
+    else
+        fail2ban-client "$@" 2>/dev/null
+    fi
+}
+
+find_docker_f2b_containers() {
+    docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | while IFS=$'\t' read -r name image; do
+            if [[ "$image" == *fail2ban* ]] || docker exec "$name" which fail2ban-client &>/dev/null 2>&1; then
+                echo "$name"
+            fi
+        done
+}
+
+resolve_host_mount() {
+    local container="$1"
+    local container_path="$2"
+    docker inspect "$container" 2>/dev/null \
+        | grep -A2 "\"Destination\": \"${container_path}\"" \
+        | grep '"Source"' \
+        | head -1 \
+        | sed 's/.*"Source": "//;s/".*//'
+}
+
+resolve_whitelist_file() {
+    if [[ "$F2B_MODE" == "native" ]]; then
+        WHITELIST_FILE="/etc/fail2ban/jail.local"
+        return
+    fi
+
+    local host_path
+    host_path=$(resolve_host_mount "$F2B_CONTAINER" "/etc/fail2ban/jail.local")
+    if [[ -n "$host_path" && -f "$host_path" ]]; then
+        WHITELIST_FILE="$host_path"
+        return
+    fi
+
+    host_path=$(resolve_host_mount "$F2B_CONTAINER" "/etc/fail2ban")
+    if [[ -n "$host_path" ]]; then
+        WHITELIST_FILE="${host_path}/jail.local"
+        return
+    fi
+
+    local compose_dir
+    compose_dir=$(docker inspect "$F2B_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null)
+    if [[ -n "$compose_dir" ]]; then
+        for candidate in \
+            "${compose_dir}/fail2ban/jail.local" \
+            "${compose_dir}/config/fail2ban/jail.local"; do
+            if [[ -f "$candidate" ]]; then
+                WHITELIST_FILE="$candidate"
+                return
+            fi
+        done
+    fi
+
+    WHITELIST_FILE=""
+}
+
+resolve_log_file() {
+    if [[ "$F2B_MODE" == "native" ]]; then
+        F2B_LOG="/var/log/fail2ban.log"
+        return
+    fi
+    F2B_LOG="docker:${F2B_CONTAINER}:/var/log/fail2ban.log"
+}
+
+grep_log() {
+    local pattern="$1"
+    local flags="${2:-}"
+    if [[ "$F2B_LOG" == docker:* ]]; then
+        local ctr="${F2B_LOG#docker:}"
+        ctr="${ctr%%:*}"
+        local path="${F2B_LOG##*:}"
+        docker exec "$ctr" grep $flags "$pattern" "$path" 2>/dev/null || true
+    elif [[ -f "$F2B_LOG" ]]; then
+        grep $flags "$pattern" "$F2B_LOG" 2>/dev/null || true
+    fi
+}
+
+detect_mode() {
+    local has_native=false
+    local docker_containers=()
+
+    if command -v fail2ban-client &>/dev/null; then
+        if fail2ban-client status &>/dev/null; then
+            has_native=true
+        fi
+    fi
+
+    if command -v docker &>/dev/null; then
+        while IFS= read -r c; do
+            [[ -n "$c" ]] && docker_containers+=("$c")
+        done < <(find_docker_f2b_containers)
+    fi
+
+    local total=0
+    $has_native && ((total++))
+    total=$((total + ${#docker_containers[@]}))
+
+    if [[ $total -eq 0 ]]; then
+        die "No fail2ban instance found.\n\nChecked: native service, Docker containers."
+    fi
+
+    if [[ $total -eq 1 ]]; then
+        if $has_native; then
+            F2B_MODE="native"
+        else
+            F2B_MODE="docker"
+            F2B_CONTAINER="${docker_containers[0]}"
+        fi
+    else
+        local items=()
+        if $has_native; then
+            items+=("native" "Local fail2ban service")
+        fi
+        for c in "${docker_containers[@]}"; do
+            local img
+            img=$(docker inspect --format '{{.Config.Image}}' "$c" 2>/dev/null)
+            items+=("$c" "Docker: ${img:-unknown}")
+        done
+
+        local choice
+        choice=$($DIALOG --backtitle "$BACKTITLE" \
+            --title "Multiple fail2ban instances found" \
+            --menu "Select which instance to manage:" 15 65 10 \
+            "${items[@]}" 3>&1 1>&2 2>&3) || exit 0
+
+        if [[ "$choice" == "native" ]]; then
+            F2B_MODE="native"
+        else
+            F2B_MODE="docker"
+            F2B_CONTAINER="$choice"
+        fi
+    fi
+
+    resolve_whitelist_file
+    resolve_log_file
+
+    local mode_label="$F2B_MODE"
+    [[ "$F2B_MODE" == "docker" ]] && mode_label="docker ($F2B_CONTAINER)"
+    BACKTITLE="fail2ban Manager v${VERSION}  ─  ${mode_label}"
+}
+
+# ─── Startup Checks ───────────────────────────────────────────────────
 
 check_root() {
     [[ $EUID -eq 0 ]] || die "This tool must be run as root."
 }
 
 check_deps() {
-    for cmd in dialog fail2ban-client; do
-        command -v "$cmd" &>/dev/null || die "'$cmd' is not installed.\n\nInstall with: apt install $cmd"
-    done
+    command -v dialog &>/dev/null || die "'dialog' is not installed.\n\nInstall with: apt install dialog"
+    if ! command -v fail2ban-client &>/dev/null && ! command -v docker &>/dev/null; then
+        die "Neither 'fail2ban-client' nor 'docker' found.\n\nInstall fail2ban or Docker."
+    fi
 }
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 
 get_jails() {
-    fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*://;s/,/ /g' | xargs
+    f2b_exec status | grep "Jail list:" | sed 's/.*://;s/,/ /g' | xargs
 }
 
 get_banned_ips() {
     local jail="$1"
-    fail2ban-client status "$jail" 2>/dev/null \
+    f2b_exec status "$jail" \
         | grep "Banned IP list:" \
         | sed 's/.*Banned IP list://' \
         | xargs
@@ -43,10 +200,11 @@ get_banned_ips() {
 
 get_jail_info() {
     local jail="$1"
-    fail2ban-client status "$jail" 2>/dev/null
+    f2b_exec status "$jail"
 }
 
 ensure_jail_local() {
+    [[ -n "$WHITELIST_FILE" ]] || return 1
     if [[ ! -f "$WHITELIST_FILE" ]]; then
         cat > "$WHITELIST_FILE" <<'CONF'
 [DEFAULT]
@@ -118,7 +276,15 @@ show_status() {
     local jails
     jails=$(get_jails)
 
-    output+="Service: $(systemctl is-active fail2ban 2>/dev/null || echo unknown)\n"
+    if [[ "$F2B_MODE" == "native" ]]; then
+        output+="Mode   : native\n"
+        output+="Service: $(systemctl is-active fail2ban 2>/dev/null || echo unknown)\n"
+    else
+        local state
+        state=$(docker inspect --format '{{.State.Status}}' "$F2B_CONTAINER" 2>/dev/null || echo unknown)
+        output+="Mode     : docker\n"
+        output+="Container: ${F2B_CONTAINER} (${state})\n"
+    fi
     output+="─────────────────────────────────────────\n\n"
 
     for jail in $jails; do
@@ -139,7 +305,7 @@ show_status() {
 
     $DIALOG --backtitle "$BACKTITLE" \
         --title "fail2ban Status" \
-        --msgbox "$output" 20 55
+        --msgbox "$output" 22 55
 }
 
 # ─── Banned IPs ────────────────────────────────────────────────────────
@@ -168,7 +334,7 @@ show_banned() {
 
     $DIALOG --backtitle "$BACKTITLE" \
         --yesno "Unban '$chosen' from jail '$jail'?" 7 50 && {
-        fail2ban-client set "$jail" unbanip "$chosen" 2>&1
+        f2b_exec set "$jail" unbanip "$chosen"
         $DIALOG --backtitle "$BACKTITLE" --msgbox "Unbanned: $chosen" 7 40
     }
 }
@@ -194,7 +360,7 @@ do_ban() {
     $DIALOG --backtitle "$BACKTITLE" \
         --yesno "Ban '$ip' in jail '$jail'?" 7 50 && {
         local result
-        result=$(fail2ban-client set "$jail" banip "$ip" 2>&1)
+        result=$(f2b_exec set "$jail" banip "$ip" 2>&1)
         $DIALOG --backtitle "$BACKTITLE" --msgbox "Result: $result" 8 55
     }
 }
@@ -228,7 +394,7 @@ do_unban() {
     local count=0
     for ip in $selected; do
         ip=$(echo "$ip" | tr -d '"')
-        fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && ((count++))
+        f2b_exec set "$jail" unbanip "$ip" && ((count++))
     done
 
     $DIALOG --backtitle "$BACKTITLE" --msgbox "Unbanned $count IP(s) from '$jail'." 7 45
@@ -252,7 +418,7 @@ do_unban_all() {
 
     $DIALOG --backtitle "$BACKTITLE" \
         --yesno "Unban ALL $count IPs from jail '$jail'?\n\nThis cannot be undone." 9 50 && {
-        fail2ban-client set "$jail" unbanip --all 2>&1
+        f2b_exec set "$jail" unbanip --all
         $DIALOG --backtitle "$BACKTITLE" --msgbox "All IPs unbanned from '$jail'." 7 45
     }
 }
@@ -266,7 +432,7 @@ show_whitelist() {
 
     for jail in $jails; do
         local ips
-        ips=$(fail2ban-client get "$jail" ignoreip 2>/dev/null || echo "(unable to read)")
+        ips=$(f2b_exec get "$jail" ignoreip || echo "(unable to read)")
         output+="Jail: $jail\n"
         if [[ -n "$ips" ]]; then
             while IFS= read -r line; do
@@ -279,17 +445,17 @@ show_whitelist() {
         output+="\n"
     done
 
-    if [[ -f "$WHITELIST_FILE" ]]; then
+    if [[ -n "$WHITELIST_FILE" && -f "$WHITELIST_FILE" ]]; then
         local global
         global=$(grep -oP '(?<=ignoreip\s=\s).*' "$WHITELIST_FILE" 2>/dev/null || true)
         if [[ -n "$global" ]]; then
-            output+="Global (jail.local):\n  $global\n"
+            output+="Persistent (${WHITELIST_FILE}):\n  $global\n"
         fi
     fi
 
     $DIALOG --backtitle "$BACKTITLE" \
         --title "Whitelisted IPs" \
-        --msgbox "$output" 22 65
+        --msgbox "$output" 22 70
 }
 
 # ─── Add to Whitelist ──────────────────────────────────────────────────
@@ -307,14 +473,23 @@ do_whitelist_add() {
         return
     fi
 
+    local persist_available=false
+    [[ -n "$WHITELIST_FILE" ]] && persist_available=true
+
     local method
-    method=$($DIALOG --backtitle "$BACKTITLE" \
-        --title "Whitelist Method" \
-        --menu "How should the IP be whitelisted?" 12 60 3 \
-        "RUNTIME" "Add to running jails only (lost on restart)" \
-        "PERSIST" "Add to jail.local (survives restart)" \
-        "BOTH"    "Add to both runtime and jail.local" \
-        3>&1 1>&2 2>&3) || return
+    if $persist_available; then
+        method=$($DIALOG --backtitle "$BACKTITLE" \
+            --title "Whitelist Method" \
+            --menu "How should the IP be whitelisted?" 12 60 3 \
+            "RUNTIME" "Add to running jails only (lost on restart)" \
+            "PERSIST" "Add to jail.local (survives restart)" \
+            "BOTH"    "Add to both runtime and jail.local" \
+            3>&1 1>&2 2>&3) || return
+    else
+        method="RUNTIME"
+        $DIALOG --backtitle "$BACKTITLE" \
+            --msgbox "No host-mounted jail.local found.\nOnly runtime whitelist is available." 8 55
+    fi
 
     local jails
     jails=$(get_jails)
@@ -324,12 +499,16 @@ do_whitelist_add() {
         RUNTIME|BOTH)
             for jail in $jails; do
                 local r
-                r=$(fail2ban-client set "$jail" addignoreip "$ip" 2>&1)
+                r=$(f2b_exec set "$jail" addignoreip "$ip" 2>&1)
                 results+="[$jail] runtime: $r\n"
             done
             ;;&
         PERSIST|BOTH)
-            ensure_jail_local
+            ensure_jail_local || {
+                results+="[jail.local] cannot write — path unknown\n"
+                $DIALOG --backtitle "$BACKTITLE" --title "Whitelist Result" --msgbox "$results" 12 60
+                return
+            }
             if grep -q "^ignoreip" "$WHITELIST_FILE" 2>/dev/null; then
                 local current
                 current=$(grep "^ignoreip" "$WHITELIST_FILE" | head -1)
@@ -360,7 +539,7 @@ do_whitelist_remove() {
 
     for jail in $jails; do
         local ips
-        ips=$(fail2ban-client get "$jail" ignoreip 2>/dev/null \
+        ips=$(f2b_exec get "$jail" ignoreip \
             | grep -oP '\d+\.\d+\.\d+\.\d+(/\d+)?' || true)
         for ip in $ips; do
             if [[ ! " ${all_ips[*]} " =~ " $ip " ]]; then
@@ -393,12 +572,12 @@ do_whitelist_remove() {
 
         for jail in $jails; do
             local r
-            r=$(fail2ban-client set "$jail" delignoreip "$ip" 2>&1) && \
+            r=$(f2b_exec set "$jail" delignoreip "$ip" 2>&1) && \
                 results+="[$jail] removed $ip\n" || \
                 results+="[$jail] $ip not found\n"
         done
 
-        if [[ -f "$WHITELIST_FILE" ]] && grep -q "$ip" "$WHITELIST_FILE"; then
+        if [[ -n "$WHITELIST_FILE" && -f "$WHITELIST_FILE" ]] && grep -q "$ip" "$WHITELIST_FILE"; then
             sed -i "s| *$ip||g" "$WHITELIST_FILE"
             results+="[jail.local] removed $ip\n"
         fi
@@ -430,26 +609,26 @@ do_search() {
         fi
 
         local ignored
-        ignored=$(fail2ban-client get "$jail" ignoreip 2>/dev/null || true)
+        ignored=$(f2b_exec get "$jail" ignoreip 2>&1 || true)
         if echo "$ignored" | grep -qw "$ip"; then
             results+="WHITELISTED in jail '$jail'\n"
         fi
     done
 
-    if [[ -f /var/log/fail2ban.log ]]; then
-        local log_hits
-        log_hits=$(grep -c "$ip" /var/log/fail2ban.log 2>/dev/null || echo 0)
+    local log_hits
+    log_hits=$(grep_log "$ip" "-c")
+    log_hits=${log_hits:-0}
+    if [[ "$log_hits" -gt 0 ]]; then
         results+="\nLog mentions: $log_hits\n"
-
-        if [[ "$log_hits" -gt 0 ]]; then
-            local recent
-            recent=$(grep "$ip" /var/log/fail2ban.log 2>/dev/null | tail -5)
-            results+="\nRecent log entries:\n$recent\n"
-        fi
+        local recent
+        recent=$(grep_log "$ip" "" | tail -5)
+        results+="\nRecent log entries:\n$recent\n"
+    else
+        results+="\nLog mentions: 0\n"
     fi
 
-    if [[ -z "$results" ]]; then
-        results="IP '$ip' not found in any jail."
+    if [[ -z "$results" || "$results" == *"Log mentions: 0"* && ! "$results" == *"BANNED"* && ! "$results" == *"WHITELISTED"* ]]; then
+        [[ "$results" == *"Log mentions"* ]] || results="IP '$ip' not found in any jail.\n"
     fi
 
     $DIALOG --backtitle "$BACKTITLE" \
@@ -461,5 +640,6 @@ do_search() {
 
 check_root
 check_deps
+detect_mode
 main_menu
 clear
