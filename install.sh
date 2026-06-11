@@ -7,7 +7,13 @@ set -euo pipefail
 
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="f2b-manager"
-SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_URL="https://raw.githubusercontent.com/gokcer/f2b-manager/main/f2b-manager"
+
+# Detect if running from a local clone or piped via curl/wget
+SOURCE_DIR=""
+if [[ -f "$(dirname "$0")/${SCRIPT_NAME}" ]] 2>/dev/null; then
+    SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -54,7 +60,14 @@ else
 fi
 
 # Install
-install -m 755 "${SOURCE_DIR}/${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"
+if [[ -n "$SOURCE_DIR" && -f "${SOURCE_DIR}/${SCRIPT_NAME}" ]]; then
+    install -m 755 "${SOURCE_DIR}/${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"
+else
+    info "Downloading ${SCRIPT_NAME} from GitHub..."
+    curl -fsSL "$REPO_URL" -o "${INSTALL_DIR}/${SCRIPT_NAME}" \
+        || error "Failed to download ${SCRIPT_NAME} from GitHub"
+    chmod 755 "${INSTALL_DIR}/${SCRIPT_NAME}"
+fi
 info "Installed to ${INSTALL_DIR}/${SCRIPT_NAME}"
 
 echo ""
