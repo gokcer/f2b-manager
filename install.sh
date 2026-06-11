@@ -11,8 +11,15 @@ REPO_URL="https://raw.githubusercontent.com/gokcer/f2b-manager/main/f2b-manager"
 
 # Detect if running from a local clone or piped via curl/wget
 SOURCE_DIR=""
-if [[ -f "$(dirname "$0")/${SCRIPT_NAME}" ]] 2>/dev/null; then
-    SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$0"
+if [[ "$SELF" != "bash" && "$SELF" != "-bash" && "$SELF" != "/bin/bash" \
+   && "$SELF" != "/usr/bin/bash" && "$SELF" != "sh" && "$SELF" != "/bin/sh" \
+   && "$SELF" != "/dev/stdin" && "$SELF" != "/dev/fd/"* \
+   && "$SELF" != "/proc/"* ]]; then
+    REAL_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+    if [[ -n "$REAL_DIR" && -f "${REAL_DIR}/${SCRIPT_NAME}" ]]; then
+        SOURCE_DIR="$REAL_DIR"
+    fi
 fi
 
 RED='\033[0;31m'
