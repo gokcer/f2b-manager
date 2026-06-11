@@ -9,17 +9,11 @@ INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="f2b-manager"
 REPO_URL="https://raw.githubusercontent.com/gokcer/f2b-manager/main/f2b-manager"
 
-# Detect if running from a local clone or piped via curl/wget
-SOURCE_DIR=""
-SELF="$0"
-if [[ "$SELF" != "bash" && "$SELF" != "-bash" && "$SELF" != "/bin/bash" \
-   && "$SELF" != "/usr/bin/bash" && "$SELF" != "sh" && "$SELF" != "/bin/sh" \
-   && "$SELF" != "/dev/stdin" && "$SELF" != "/dev/fd/"* \
-   && "$SELF" != "/proc/"* ]]; then
-    REAL_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
-    if [[ -n "$REAL_DIR" && -f "${REAL_DIR}/${SCRIPT_NAME}" ]]; then
-        SOURCE_DIR="$REAL_DIR"
-    fi
+# Resolve local source dir (only works when run as ./install.sh from a clone)
+SOURCE_FILE=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || true
+if [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/${SCRIPT_NAME}" ]]; then
+    SOURCE_FILE="${SCRIPT_DIR}/${SCRIPT_NAME}"
 fi
 
 RED='\033[0;31m'
@@ -67,8 +61,9 @@ else
 fi
 
 # Install
-if [[ -n "$SOURCE_DIR" && -f "${SOURCE_DIR}/${SCRIPT_NAME}" ]]; then
-    install -m 755 "${SOURCE_DIR}/${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"
+if [[ -n "$SOURCE_FILE" ]]; then
+    info "Installing from local source: ${SOURCE_FILE}"
+    install -m 755 "$SOURCE_FILE" "${INSTALL_DIR}/${SCRIPT_NAME}"
 else
     info "Downloading ${SCRIPT_NAME} from GitHub..."
     curl -fsSL "$REPO_URL" -o "${INSTALL_DIR}/${SCRIPT_NAME}" \
