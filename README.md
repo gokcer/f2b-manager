@@ -6,6 +6,8 @@ Works with both **native** and **Docker-based** fail2ban installations — run i
 
 Built with [`dialog`](https://invisible-island.net/dialog/) — no Python, no extra runtimes, just a single bash script.
 
+![Main Menu](screenshots/01-main-menu.png)
+
 ## Features
 
 - **Auto-detection** — finds fail2ban whether it runs natively or inside Docker (e.g. `crazymax/fail2ban`)
@@ -18,6 +20,50 @@ Built with [`dialog`](https://invisible-island.net/dialog/) — no Python, no ex
 - **Flexible whitelisting** — choose runtime-only, persistent (`jail.local`), or both
 - **IP search** — search an IP across all jails (banned status, whitelist, log history)
 - **Docker volume awareness** — resolves host-mounted `jail.local` for persistent whitelist edits
+
+## Screenshots
+
+### Jail Status Overview
+
+View service status, banned counts, and failed attempts for all jails at a glance.
+
+![Status](screenshots/02-status.png)
+
+### Banned IPs
+
+Browse currently banned IPs per jail. Select any IP to unban it directly.
+
+![Banned IPs](screenshots/03-banned-ips.png)
+
+### Bulk Unban
+
+Select multiple IPs to unban at once using the checklist interface.
+
+![Unban Checklist](screenshots/05-unban-checklist.png)
+
+### Ban an IP
+
+Manually ban an IP address in any jail.
+
+![Ban IP](screenshots/04-ban-ip.png)
+
+### Whitelist Management
+
+Choose how to whitelist an IP: runtime-only, persistent (written to `jail.local`), or both.
+
+![Whitelist Method](screenshots/08-whitelist-method.png)
+
+### Search
+
+Search for an IP across all jails — check if it's banned, whitelisted, or appears in logs.
+
+![Search](screenshots/09-search.png)
+
+### Docker Instance Selection
+
+When multiple fail2ban instances are detected (native + Docker containers), the tool prompts you to choose which one to manage.
+
+![Instance Selection](screenshots/10-instance-select.png)
 
 ## Requirements
 
