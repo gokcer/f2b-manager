@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+#
+# f2b-manager — Interactive TUI for managing fail2ban bans & whitelist
+#
+# https://github.com/gokcer/f2b-manager
+# License: MIT
+#
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+DIALOG=${DIALOG:-dialog}
+DIALOG_OK=0
+BACKTITLE="fail2ban Manager v${VERSION}"
+WHITELIST_FILE="/etc/fail2ban/jail.local"
+
+die() { $DIALOG --backtitle "$BACKTITLE" --msgbox "ERROR: $1" 8 60; exit 1; }
+
+check_root() {
+    [[ $EUID -eq 0 ]] || die "This tool must be run as root."
+}
+
+check_deps() {
+    for cmd in dialog fail2ban-client; do
+        command -v "$cmd" &>/dev/null || die "'$cmd' is not installed.\n\nInstall with: apt install $cmd"
+    done
+}
+
+# ─── Helpers ───────────────────────────────────────────────────────────
+
+get_jails() {
+    fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*://;s/,/ /g' | xargs
+}
+
+get_banned_ips() {
+    local jail="$1"
+    fail2ban-client status "$jail" 2>/dev/null \
+        | grep "Banned IP list:" \
+        | sed 's/.*Banned IP list://' \
+        | xargs
+}
+
+get_jail_info() {
+    local jail="$1"
+    fail2ban-client status "$jail" 2>/dev/null
+}
+
+ensure_jail_local() {
+    if [[ ! -f "$WHITELIST_FILE" ]]; then
+        cat > "$WHITELIST_FILE" <<'CONF'
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+CONF
+    fi
+}
+
+# ─── Jail Selection ───────────────────────────────────────────────────
+
+select_jail() {
+    local jails
+    jails=$(get_jails)
+    [[ -z "$jails" ]] && { $DIALOG --backtitle "$BACKTITLE" --msgbox "No active jails found." 7 40; return 1; }
+
+    local items=()
+    for j in $jails; do
+        local banned
+        banned=$(get_banned_ips "$j" | wc -w)
+        items+=("$j" "Banned: $banned IPs")
+    done
+
+    local choice
+    choice=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Select Jail" \
+        --menu "Choose a jail to manage:" 15 60 10 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return 1
+    echo "$choice"
+}
+
+# ─── Main Menu ─────────────────────────────────────────────────────────
+
+main_menu() {
+    while true; do
+        local choice
+        choice=$($DIALOG --backtitle "$BACKTITLE" \
+            --title " fail2ban Manager " \
+            --cancel-label "Exit" \
+            --menu "\nSelect an action:" 18 60 9 \
+            "STATUS"    "Overview of all jails" \
+            "BANNED"    "View banned IPs (by jail)" \
+            "BAN"       "Manually ban an IP" \
+            "UNBAN"     "Unban an IP" \
+            "UNBAN_ALL" "Unban ALL IPs from a jail" \
+            "WHITELIST" "View whitelisted IPs" \
+            "WL_ADD"    "Add IP to whitelist" \
+            "WL_REMOVE" "Remove IP from whitelist" \
+            "SEARCH"    "Search IP across all jails" \
+            3>&1 1>&2 2>&3) || break
+
+        case "$choice" in
+            STATUS)    show_status ;;
+            BANNED)    show_banned ;;
+            BAN)       do_ban ;;
+            UNBAN)     do_unban ;;
+            UNBAN_ALL) do_unban_all ;;
+            WHITELIST) show_whitelist ;;
+            WL_ADD)    do_whitelist_add ;;
+            WL_REMOVE) do_whitelist_remove ;;
+            SEARCH)    do_search ;;
+        esac
+    done
+}
+
+# ─── Status ────────────────────────────────────────────────────────────
+
+show_status() {
+    local output=""
+    local jails
+    jails=$(get_jails)
+
+    output+="Service: $(systemctl is-active fail2ban 2>/dev/null || echo unknown)\n"
+    output+="─────────────────────────────────────────\n\n"
+
+    for jail in $jails; do
+        local info
+        info=$(get_jail_info "$jail")
+        local currently_banned total_banned currently_failed total_failed
+        currently_banned=$(echo "$info" | grep "Currently banned:" | awk '{print $NF}')
+        total_banned=$(echo "$info" | grep "Total banned:" | awk '{print $NF}')
+        currently_failed=$(echo "$info" | grep "Currently failed:" | awk '{print $NF}')
+        total_failed=$(echo "$info" | grep "Total failed:" | awk '{print $NF}')
+
+        output+="Jail: ${jail}\n"
+        output+="  Currently banned : ${currently_banned:-0}\n"
+        output+="  Total banned     : ${total_banned:-0}\n"
+        output+="  Currently failed : ${currently_failed:-0}\n"
+        output+="  Total failed     : ${total_failed:-0}\n\n"
+    done
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --title "fail2ban Status" \
+        --msgbox "$output" 20 55
+}
+
+# ─── Banned IPs ────────────────────────────────────────────────────────
+
+show_banned() {
+    local jail
+    jail=$(select_jail) || return
+
+    local banned
+    banned=$(get_banned_ips "$jail")
+    if [[ -z "$banned" ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "No banned IPs in jail '$jail'." 7 45
+        return
+    fi
+
+    local items=()
+    for ip in $banned; do
+        items+=("$ip" "")
+    done
+
+    local chosen
+    chosen=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Banned IPs — $jail" \
+        --menu "Select an IP to unban, or Cancel to go back:" 20 55 12 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --yesno "Unban '$chosen' from jail '$jail'?" 7 50 && {
+        fail2ban-client set "$jail" unbanip "$chosen" 2>&1
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "Unbanned: $chosen" 7 40
+    }
+}
+
+# ─── Ban IP ────────────────────────────────────────────────────────────
+
+do_ban() {
+    local jail
+    jail=$(select_jail) || return
+
+    local ip
+    ip=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Ban IP" \
+        --inputbox "Enter IP address to ban in jail '$jail':" 9 55 \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && \
+       [[ ! "$ip" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "Invalid IP format: $ip" 7 45
+        return
+    fi
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --yesno "Ban '$ip' in jail '$jail'?" 7 50 && {
+        local result
+        result=$(fail2ban-client set "$jail" banip "$ip" 2>&1)
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "Result: $result" 8 55
+    }
+}
+
+# ─── Unban IP ──────────────────────────────────────────────────────────
+
+do_unban() {
+    local jail
+    jail=$(select_jail) || return
+
+    local banned
+    banned=$(get_banned_ips "$jail")
+    if [[ -z "$banned" ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "No banned IPs in jail '$jail'." 7 45
+        return
+    fi
+
+    local items=()
+    for ip in $banned; do
+        items+=("$ip" "" "off")
+    done
+
+    local selected
+    selected=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Unban IPs — $jail" \
+        --checklist "Select IPs to unban (Space to toggle):" 20 55 12 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return
+
+    [[ -z "$selected" ]] && return
+
+    local count=0
+    for ip in $selected; do
+        ip=$(echo "$ip" | tr -d '"')
+        fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && ((count++))
+    done
+
+    $DIALOG --backtitle "$BACKTITLE" --msgbox "Unbanned $count IP(s) from '$jail'." 7 45
+}
+
+# ─── Unban All ─────────────────────────────────────────────────────────
+
+do_unban_all() {
+    local jail
+    jail=$(select_jail) || return
+
+    local banned
+    banned=$(get_banned_ips "$jail")
+    local count
+    count=$(echo "$banned" | wc -w)
+
+    if [[ $count -eq 0 ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "No banned IPs in jail '$jail'." 7 45
+        return
+    fi
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --yesno "Unban ALL $count IPs from jail '$jail'?\n\nThis cannot be undone." 9 50 && {
+        fail2ban-client set "$jail" unbanip --all 2>&1
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "All IPs unbanned from '$jail'." 7 45
+    }
+}
+
+# ─── Whitelist ─────────────────────────────────────────────────────────
+
+show_whitelist() {
+    local output=""
+    local jails
+    jails=$(get_jails)
+
+    for jail in $jails; do
+        local ips
+        ips=$(fail2ban-client get "$jail" ignoreip 2>/dev/null || echo "(unable to read)")
+        output+="Jail: $jail\n"
+        if [[ -n "$ips" ]]; then
+            while IFS= read -r line; do
+                line=$(echo "$line" | xargs)
+                [[ -n "$line" ]] && output+="  $line\n"
+            done <<< "$ips"
+        else
+            output+="  (none)\n"
+        fi
+        output+="\n"
+    done
+
+    if [[ -f "$WHITELIST_FILE" ]]; then
+        local global
+        global=$(grep -oP '(?<=ignoreip\s=\s).*' "$WHITELIST_FILE" 2>/dev/null || true)
+        if [[ -n "$global" ]]; then
+            output+="Global (jail.local):\n  $global\n"
+        fi
+    fi
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --title "Whitelisted IPs" \
+        --msgbox "$output" 22 65
+}
+
+# ─── Add to Whitelist ──────────────────────────────────────────────────
+
+do_whitelist_add() {
+    local ip
+    ip=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Whitelist IP" \
+        --inputbox "Enter IP or CIDR to whitelist (e.g. 192.168.1.0/24):" 9 60 \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && \
+       [[ ! "$ip" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "Invalid IP format: $ip" 7 45
+        return
+    fi
+
+    local method
+    method=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Whitelist Method" \
+        --menu "How should the IP be whitelisted?" 12 60 3 \
+        "RUNTIME" "Add to running jails only (lost on restart)" \
+        "PERSIST" "Add to jail.local (survives restart)" \
+        "BOTH"    "Add to both runtime and jail.local" \
+        3>&1 1>&2 2>&3) || return
+
+    local jails
+    jails=$(get_jails)
+    local results=""
+
+    case "$method" in
+        RUNTIME|BOTH)
+            for jail in $jails; do
+                local r
+                r=$(fail2ban-client set "$jail" addignoreip "$ip" 2>&1)
+                results+="[$jail] runtime: $r\n"
+            done
+            ;;&
+        PERSIST|BOTH)
+            ensure_jail_local
+            if grep -q "^ignoreip" "$WHITELIST_FILE" 2>/dev/null; then
+                local current
+                current=$(grep "^ignoreip" "$WHITELIST_FILE" | head -1)
+                if ! echo "$current" | grep -qw "$ip"; then
+                    sed -i "s|^ignoreip.*|& $ip|" "$WHITELIST_FILE"
+                    results+="[jail.local] added $ip\n"
+                else
+                    results+="[jail.local] $ip already present\n"
+                fi
+            else
+                echo "ignoreip = 127.0.0.1/8 ::1 $ip" >> "$WHITELIST_FILE"
+                results+="[jail.local] added $ip (new ignoreip line)\n"
+            fi
+            ;;
+    esac
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --title "Whitelist Result" \
+        --msgbox "$results" 14 60
+}
+
+# ─── Remove from Whitelist ─────────────────────────────────────────────
+
+do_whitelist_remove() {
+    local all_ips=()
+    local jails
+    jails=$(get_jails)
+
+    for jail in $jails; do
+        local ips
+        ips=$(fail2ban-client get "$jail" ignoreip 2>/dev/null \
+            | grep -oP '\d+\.\d+\.\d+\.\d+(/\d+)?' || true)
+        for ip in $ips; do
+            if [[ ! " ${all_ips[*]} " =~ " $ip " ]]; then
+                all_ips+=("$ip")
+            fi
+        done
+    done
+
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        $DIALOG --backtitle "$BACKTITLE" --msgbox "No whitelisted IPs found." 7 40
+        return
+    fi
+
+    local items=()
+    for ip in "${all_ips[@]}"; do
+        items+=("$ip" "" "off")
+    done
+
+    local selected
+    selected=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Remove from Whitelist" \
+        --checklist "Select IPs to remove from whitelist:" 18 55 10 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return
+
+    [[ -z "$selected" ]] && return
+
+    local results=""
+    for ip in $selected; do
+        ip=$(echo "$ip" | tr -d '"')
+
+        for jail in $jails; do
+            local r
+            r=$(fail2ban-client set "$jail" delignoreip "$ip" 2>&1) && \
+                results+="[$jail] removed $ip\n" || \
+                results+="[$jail] $ip not found\n"
+        done
+
+        if [[ -f "$WHITELIST_FILE" ]] && grep -q "$ip" "$WHITELIST_FILE"; then
+            sed -i "s| *$ip||g" "$WHITELIST_FILE"
+            results+="[jail.local] removed $ip\n"
+        fi
+    done
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --title "Whitelist Removal" \
+        --msgbox "$results" 14 60
+}
+
+# ─── Search IP ─────────────────────────────────────────────────────────
+
+do_search() {
+    local ip
+    ip=$($DIALOG --backtitle "$BACKTITLE" \
+        --title "Search IP" \
+        --inputbox "Enter IP address to search across all jails:" 9 55 \
+        3>&1 1>&2 2>&3) || return
+
+    local results=""
+    local jails
+    jails=$(get_jails)
+
+    for jail in $jails; do
+        local banned
+        banned=$(get_banned_ips "$jail")
+        if echo "$banned" | grep -qw "$ip"; then
+            results+="BANNED in jail '$jail'\n"
+        fi
+
+        local ignored
+        ignored=$(fail2ban-client get "$jail" ignoreip 2>/dev/null || true)
+        if echo "$ignored" | grep -qw "$ip"; then
+            results+="WHITELISTED in jail '$jail'\n"
+        fi
+    done
+
+    if [[ -f /var/log/fail2ban.log ]]; then
+        local log_hits
+        log_hits=$(grep -c "$ip" /var/log/fail2ban.log 2>/dev/null || echo 0)
+        results+="\nLog mentions: $log_hits\n"
+
+        if [[ "$log_hits" -gt 0 ]]; then
+            local recent
+            recent=$(grep "$ip" /var/log/fail2ban.log 2>/dev/null | tail -5)
+            results+="\nRecent log entries:\n$recent\n"
+        fi
+    fi
+
+    if [[ -z "$results" ]]; then
+        results="IP '$ip' not found in any jail."
+    fi
+
+    $DIALOG --backtitle "$BACKTITLE" \
+        --title "Search Results — $ip" \
+        --msgbox "$results" 22 75
+}
+
+# ─── Entry Point ───────────────────────────────────────────────────────
+
+check_root
+check_deps
+main_menu
+clear
